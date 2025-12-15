@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import paho.mqtt.client as mqtt
 import json
 import os
+import uvicorn  # Needed for running the server
 
 # =====================================================
 # USER STORAGE (FIXED FOR CLOUD HOSTING)
@@ -25,15 +26,12 @@ def load_users():
             print(f"ERROR: File exists but is corrupt: {e}")
 
     # 3. EMERGENCY FALLBACK
-    # If file is missing or corrupt, we return these hardcoded users.
-    # This prevents the "White Screen" because 'admin' will ALWAYS exist.
     print("WARNING: users.json not found or readable. Using default in-memory users.")
     default_users = {
         "admin": {"password": "admin123", "role": "admin"},
         "user": {"password": "user123", "role": "user"},
     }
     
-    # Try to write this file back to disk (might fail on some read-only clouds, but that's okay)
     try:
         with open(USERS_FILE, "w") as f:
             json.dump(default_users, f, indent=4)
@@ -60,7 +58,9 @@ app = FastAPI()
 
 origins = [
     "http://localhost:5173",
-    "smart-home-system-lime.vercel.app",
+    "https://smart-home-system-lime.vercel.app",  # Added https://
+    "http://smart-home-system-lime.vercel.app",
+    "*"  # Fallback: Allow all for debugging
 ]
 
 app.add_middleware(
@@ -75,7 +75,7 @@ app.add_middleware(
 # STORAGE FOR IOT DATA
 # =====================================================
 latest_data: dict = {}
-system_limits: dict = {}  # { "ESP32-1": {"temp_th": 30.0, "gas_th": 1.2}, ... }
+system_limits: dict = {}
 
 # =====================================================
 # Pydantic MODELS
@@ -85,32 +85,26 @@ class UserCreate(BaseModel):
     password: str
     role: str
 
-
 class UserLogin(BaseModel):
     username: str
     password: str
-
 
 class UserUpdate(BaseModel):
     username: str
     password: str | None = None
     role: str | None = None
 
-
 class UserDelete(BaseModel):
     username: str
-
 
 class Command(BaseModel):
     device: str
     action: str
 
-
 class LimitUpdate(BaseModel):
     device: str
     temp_th: float | None = None
     gas_th: float | None = None
-
 
 # =====================================================
 # USER ROUTES
@@ -118,20 +112,16 @@ class LimitUpdate(BaseModel):
 @app.post("/add_user")
 def add_user(u: UserCreate):
     global users
-
     if u.username in users:
         return {"status": "error", "msg": "User already exists"}
-
-    # allow admin OR user (whatever frontend sends)
+    
     users[u.username] = {"password": u.password, "role": u.role}
     save_users(users)
     return {"status": "ok", "msg": "User added"}
 
-
 @app.post("/update_user")
 def update_user(u: UserUpdate):
     global users
-
     if u.username not in users:
         return {"status": "error", "msg": "User not found"}
 
@@ -144,12 +134,9 @@ def update_user(u: UserUpdate):
     save_users(users)
     return {"status": "ok", "msg": "User updated"}
 
-
 @app.post("/delete_user")
 def delete_user(u: UserDelete):
     global users
-
-    # prevent deleting default admin by mistake if you want
     if u.username == "admin":
         return {"status": "error", "msg": "Cannot delete default admin"}
 
@@ -160,16 +147,12 @@ def delete_user(u: UserDelete):
     save_users(users)
     return {"status": "ok", "msg": "User deleted"}
 
-
 @app.get("/users")
 def list_users():
-    # Do not expose passwords in real life, but OK for your project
     return users
-
 
 @app.post("/login")
 def login(u: UserLogin):
-    # RELOAD USERS from memory to be safe, or just check global dict
     if u.username not in users:
         return {"status": "error", "msg": "Invalid username or password"}
 
@@ -183,7 +166,6 @@ def login(u: UserLogin):
             "role": users[u.username]["role"],
         },
     }
-
 
 # =====================================================
 # PARSE SENSOR MESSAGES
@@ -241,14 +223,13 @@ def on_connect(client, userdata, flags, rc):
     print("MQTT connected:", rc)
     client.subscribe("iot/pi/data")
 
-
 def on_message(client, userdata, msg):
     global latest_data, system_limits
     raw = msg.payload.decode()
     parsed = parse_sensor_message(raw)
 
     if parsed:
-        node = parsed["node"]
+        node = parsed.get("node", "unknown")
 
         if node not in system_limits:
             system_limits[node] = {"temp_th": 30.0, "gas_th": 1.20}
@@ -263,16 +244,20 @@ def on_message(client, userdata, msg):
 # MQTT CLIENT SETUP
 # =====================================================
 mqtt_client = mqtt.Client()
+# Add your username/password here if needed
 mqtt_client.username_pw_set("p_user", "P_user123")
 mqtt_client.tls_set()
 mqtt_client.on_connect = on_connect
 mqtt_client.on_message = on_message
 
-mqtt_client.connect(
-    "08d5c716cf9f46518abcda4d565e5141.s1.eu.hivemq.cloud",
-    port=8883,
-)
-mqtt_client.loop_start()
+try:
+    mqtt_client.connect(
+        "08d5c716cf9f46518abcda4d565e5141.s1.eu.hivemq.cloud",
+        port=8883,
+    )
+    mqtt_client.loop_start()
+except Exception as e:
+    print(f"MQTT Connection Failed: {e}")
 
 
 # =====================================================
@@ -282,11 +267,9 @@ mqtt_client.loop_start()
 def root():
     return {"message": "Backend working!"}
 
-
 @app.get("/realtime")
 def realtime():
     return latest_data
-
 
 # =====================================================
 # IOT COMMAND & LIMIT ROUTES
@@ -298,7 +281,6 @@ def send_command(cmd: Command):
     r = mqtt_client.publish("iot/pi/command", message)
     print("Publishing:", message, "→ RC =", r.rc)
     return {"status": "ok", "sent": message}
-
 
 @app.post("/set_limits")
 def set_limits(limit: LimitUpdate):
@@ -324,3 +306,10 @@ def set_limits(limit: LimitUpdate):
         "updated_device": device,
         "limits": system_limits[device],
     }
+
+# =====================================================
+# SERVER STARTUP (For Local & Cloud)
+# =====================================================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
