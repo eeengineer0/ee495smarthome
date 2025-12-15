@@ -8,7 +8,7 @@ export default function Home() {
   // ==========================================
   // REPLACE THIS with your actual Railway Project URL
   // Example: "https://web-production-a1b2.up.railway.app"
-  const API_URL = "ee495smarthome-production.up.railway.app"; 
+  const API_URL = "https://ee495smarthome-production.up.railway.app"; 
 
   // ==========================================
   // 2. STATE MANAGEMENT
